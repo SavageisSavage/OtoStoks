@@ -30,7 +30,7 @@
 ## 📥 Installation & Quick Start
 
 ### Step 0: Download the Latest Release
-1. Go to the **[Releases](https://github.com/SavageisSavage/OtoStoksBot/releases/latest)** page on this repository.
+1. Go to the **[Releases](https://github.com/SavageisSavage/OtoStoks/releases/latest)** page on this repository.
 2. Under the **Assets** section, download the package for your operating system:
    * **Windows**: `OtoStoksBot-WINDOWS.exe`
    * **macOS**: `OtoStoksBot-MAC.dmg`
