@@ -18,8 +18,7 @@ POLL_IDLE_S = 0.01                 # idle poll when the game has not written a n
 SNAPSHOT_STALE_S = 5.0             # treat the feed as lost after this long without a write
 BROADCAST_IDLE_S = 0.5             # refresh the dashboard at least this often while idle
 PROCESS_CHECK_INTERVAL_S = 2.0     # how often to ask tasklist whether the game runs
-HTTP_BRIDGE_BACKOFF_S = 15.0       # skip the HTTP probe this long after repeated refusals
-HTTP_BRIDGE_FAILS_BEFORE_BACKOFF = 3
+HTTP_BRIDGE_BACKOFF_S = 15.0       # initial probe backoff; escalates to 60 s
 COMMAND_CONFIRM_TIMEOUT_MS = 2000  # max wait for the game to consume a command file
 COMMAND_CONFIRM_POLL_MS = 5        # polling granularity while confirming an order
 

@@ -12,7 +12,6 @@ from core.config import (
     check_game_process,
     COMMAND_CONFIRM_TIMEOUT_MS,
     HTTP_BRIDGE_BACKOFF_S,
-    HTTP_BRIDGE_FAILS_BEFORE_BACKOFF,
     SNAPSHOT_STALE_S,
 )
 from core.game_mod import (
@@ -30,9 +29,12 @@ CURRENT_TRANSPORT = "http"
 
 # The HTTP bridge only exists when the BepInEx DLL is loaded into the game. Probing
 # a closed port on every loop iteration costs a connection attempt, and if the port
-# is filtered rather than refused it costs the full timeout. Back off instead.
+# is filtered rather than refused it costs the full timeout. Back off instead, and
+# escalate so a filtered port cannot cost 600 ms on a fixed schedule forever.
 _http_fails: int = 0
 _http_backoff_until: float = 0.0
+_http_backoff_s: float = HTTP_BRIDGE_BACKOFF_S
+_HTTP_BACKOFF_MAX_S: float = 60.0
 
 # Shared change-driven reader for the native export file.
 FILE_WATCHER = MarketFileWatcher()
@@ -116,9 +118,24 @@ def run_auto_installer() -> Tuple[bool, str]:
     return True, f"{mod_msg} | {dll_msg}"
 
 
+def _note_http_failure() -> None:
+    """
+    Escalating backoff after a failed probe.
+
+    No attempt is made to distinguish a refused connection from a filtered one:
+    on Windows a closed local port can take about a second to refuse, so the only
+    safe assumption is that a failed probe is expensive. The backoff escalates and
+    is capped, so a bridge that appears later is still picked up within a minute.
+    """
+    global _http_fails, _http_backoff_until, _http_backoff_s
+    _http_fails += 1
+    _http_backoff_until = time.time() + _http_backoff_s
+    _http_backoff_s = min(_http_backoff_s * 2.0, _HTTP_BACKOFF_MAX_S)
+
+
 def fetch_snapshot_http(host: str = "127.0.0.1", port: int = 8765, timeout: float = 0.8) -> Optional[Dict[str, Any]]:
     """Fetches full market and portfolio snapshot from in-game HTTP server."""
-    global _http_fails, _http_backoff_until
+    global _http_fails, _http_backoff_until, _http_backoff_s
 
     if time.time() < _http_backoff_until:
         return None
@@ -131,13 +148,13 @@ def fetch_snapshot_http(host: str = "127.0.0.1", port: int = 8765, timeout: floa
                 data["source"] = "http_bridge"
                 _http_fails = 0
                 _http_backoff_until = 0.0
+                _http_backoff_s = HTTP_BRIDGE_BACKOFF_S
                 return data
     except Exception:
-        pass
+        _note_http_failure()
+        return None
 
-    _http_fails += 1
-    if _http_fails >= HTTP_BRIDGE_FAILS_BEFORE_BACKOFF:
-        _http_backoff_until = time.time() + HTTP_BRIDGE_BACKOFF_S
+    _note_http_failure()
     return None
 
 
@@ -163,7 +180,7 @@ def fetch_snapshot(host: str = "127.0.0.1", port: int = 8765) -> Optional[Dict[s
     return None
 
 
-def fetch_snapshot_change() -> Tuple[bool, Optional[Dict[str, Any]], Optional[float]]:
+def fetch_snapshot_change(allow_http: bool = True) -> Tuple[bool, Optional[Dict[str, Any]], Optional[float]]:
     """
     Change-driven variant of fetch_snapshot() for the main loop.
 
@@ -172,13 +189,17 @@ def fetch_snapshot_change() -> Tuple[bool, Optional[Dict[str, Any]], Optional[fl
     parsing, feature extraction and inference for a frame it already processed.
     The HTTP bridge exposes no file signature, so when it is live every call is
     treated as a new frame.
+
+    allow_http=False skips the bridge probe for one iteration, so the first native
+    frame is not delayed by a probe that usually costs a socket timeout.
     """
     global CURRENT_TRANSPORT
 
-    snap = fetch_snapshot_http(timeout=0.6)
-    if snap and snap.get("marketReady", False):
-        CURRENT_TRANSPORT = "http"
-        return True, snap, 0.0
+    if allow_http:
+        snap = fetch_snapshot_http(timeout=0.6)
+        if snap and snap.get("marketReady", False):
+            CURRENT_TRANSPORT = "http"
+            return True, snap, 0.0
 
     changed, native_snap, age_ms = FILE_WATCHER.poll()
     if changed and native_snap:

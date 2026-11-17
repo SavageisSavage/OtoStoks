@@ -88,6 +88,7 @@ def create_app(state: AppState) -> FastAPI:
 
         last_process_check = 0.0
         last_broadcast = 0.0
+        iteration = 0
         prev_cash: Optional[float] = None
         prev_ipo: Optional[int] = None
 
@@ -98,7 +99,8 @@ def create_app(state: AppState) -> FastAPI:
             # Process status check every 2 s. tasklist spawns a process, and this used
             # to run directly on the event loop thread: every 2 s the loop stalled for
             # tens of milliseconds, delaying in-flight orders and websocket traffic.
-            if (now - last_process_check) >= PROCESS_CHECK_INTERVAL_S:
+            # Skipped on the first iteration so a slow probe cannot delay frame one.
+            if iteration > 0 and (now - last_process_check) >= PROCESS_CHECK_INTERVAL_S:
                 last_process_check = now
                 is_running, pid = await asyncio.to_thread(check_game_process)
                 state.game_running = is_running
@@ -133,7 +135,8 @@ def create_app(state: AppState) -> FastAPI:
             # republishes market.json about once per second (measured median 1002 ms),
             # so an unchanged file costs one stat() and the loop yields again.
             with timed("snapshot_wait"):
-                changed, data, age_ms = await asyncio.to_thread(fetch_snapshot_change)
+                changed, data, age_ms = await asyncio.to_thread(fetch_snapshot_change, iteration > 0)
+            iteration += 1
 
             if not changed:
                 if state.connected and FILE_WATCHER.is_stale(age_ms):
