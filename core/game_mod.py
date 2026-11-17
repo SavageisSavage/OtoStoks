@@ -7,7 +7,6 @@ Provides zero-dependency connection to Screen Stocks via its official mod system
 - Dispatches buy, sell, short, cover, and close orders via mods/commands.
 """
 import os
-import sys
 import json
 import time
 import re
@@ -98,7 +97,7 @@ def ensure_native_mod_support(game_dir: Optional[str] = None) -> Tuple[bool, str
 
         if r'"modSupport"\s*:\s*"?true"?' not in content and '"modSupport": true' not in content and '"modSupport" : true' not in content:
             # Create backup
-            bak_path = sav_path + f".bak"
+            bak_path = sav_path + ".bak"
             shutil.copy2(sav_path, bak_path)
 
             if '"modSupport"' in content:
@@ -380,12 +379,20 @@ class MarketFileWatcher:
         changed    True only when a new market frame was published.
         snapshot   Normalised snapshot, or None when unchanged/unavailable.
         age_ms     Age of the export file in milliseconds (staleness detection).
+                   None only when the export file itself is missing, which is the
+                   one case that genuinely means "no feed".
 
         Change detection compares the file bytes rather than relying on the
         timestamp: Windows can hand back an identical st_mtime_ns for two writes
         that land close together, which would silently skip a frame. Reading the
         34 KB export costs tens of microseconds; parsing it costs ~1 ms, so the
         expensive half is still skipped for all but the first frame.
+
+        A failed read is deliberately not reported as an age of None. The game
+        rewrites market.json with exclusive access about once a second, so a
+        single failed open is normal and says nothing about the health of the
+        feed; conflating the two made the caller declare the feed dead and
+        reconnect on every tick.
         """
         self.polls += 1
         paths = get_game_paths(self.game_dir)
@@ -394,12 +401,17 @@ class MarketFileWatcher:
             return False, None, None
         try:
             st = os.stat(mfile)
-            with open(mfile, "rb") as f:
-                raw = f.read()
         except OSError:
             return False, None, None
 
         age_ms = (time.time() - st.st_mtime) * 1000.0
+
+        raw = self._read_raw(mfile)
+        if raw is None:
+            # Mid-write lock or a vanished file. The stat above gives the real
+            # age, so staleness is still judged on the file, not on this failure.
+            return False, None, age_ms
+
         if not force and raw == self._raw:
             return False, None, age_ms
 
@@ -417,11 +429,42 @@ class MarketFileWatcher:
         self.frames += 1
         return True, snap, age_ms
 
+    @staticmethod
+    def _read_raw(path: str, attempts: int = 4) -> Optional[bytes]:
+        """
+        Reads the export with a short retry.
+
+        The game holds the file exclusively while it writes, which on this machine
+        fails roughly once per publish. Retrying a few milliseconds later turns
+        that into a just-in-time read instead of pushing frame detection to the
+        next poll interval.
+        """
+        for attempt in range(attempts):
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except FileNotFoundError:
+                return None
+            except OSError:
+                if attempt == attempts - 1:
+                    return None
+                time.sleep(0.002)
+        return None
+
     def is_stale(self, age_ms: Optional[float]) -> bool:
-        """True when the export file has not advanced for longer than the limit."""
-        if age_ms is None:
+        """
+        True when the export has not advanced for longer than the limit.
+
+        The file's own age is authoritative, because it reflects when the game
+        last wrote. Only when no age can be measured at all (the file is missing
+        or unreadable for a stat) does this fall back to how long ago a frame was
+        last parsed, so that one failed syscall cannot report a dead feed.
+        """
+        if age_ms is not None:
+            return age_ms > SNAPSHOT_STALE_S * 1000.0
+        if self.last_change_at <= 0.0:
             return True
-        return age_ms > SNAPSHOT_STALE_S * 1000.0
+        return (time.time() - self.last_change_at) > SNAPSHOT_STALE_S
 
 
 def read_in_game_settings(game_dir: Optional[str] = None) -> Dict[str, Any]:

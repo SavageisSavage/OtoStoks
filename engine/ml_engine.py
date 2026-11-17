@@ -1,9 +1,8 @@
 import os
-import sys
 import time
 import threading
 from datetime import datetime
-from typing import Tuple, Dict, Any, Optional, List
+from typing import Tuple, Optional, List
 import numpy as np
 
 try:
@@ -74,15 +73,15 @@ class LocalModelEngine:
         rsi14 = float(feat[1])
         bb_pct = float(feat[2])
         bb_width = float(feat[3])
-        vol20 = float(feat[4])
+        # Slots 4 (vol20), 7 (ret8) and 12 (atr_ratio) are part of the model's
+        # input contract but are not read by this scoring path: volatility comes
+        # from the snapshot and the other two are captured by neighbouring slots.
         ret1 = float(feat[5])
         ret3 = float(feat[6])
-        ret8 = float(feat[7])
         acceleration = float(feat[8])
         zscore30 = float(feat[9])
         macd_hist = float(feat[10])
         kama_eff = float(feat[11])
-        atr_ratio = float(feat[12])
         stoch_k = float(feat[13])
         donchian_pct = float(feat[14])
         regime_score = float(feat[15])
@@ -237,8 +236,12 @@ def run_retrain_pipeline(state: AppState) -> Tuple[bool, str]:
         val_data = val_data[~np.isnan(val_data).any(axis=1)]
         val_data = val_data[~np.isinf(val_data).any(axis=1)]
 
-        X_train, y_train = train_data[:, :16], train_data[:, 16]
-        X_val, y_val = val_data[:, :16], val_data[:, 16]
+        # Take contiguous copies: LightGBM warns (and doubles peak memory) when a
+        # Dataset is built from a non-contiguous column slice of a parent array.
+        X_train = np.ascontiguousarray(train_data[:, :16])
+        y_train = train_data[:, 16]
+        X_val = np.ascontiguousarray(val_data[:, :16])
+        y_val = val_data[:, 16]
 
         train_ds = lgb.Dataset(X_train, label=y_train)
         val_ds = lgb.Dataset(X_val, label=y_val, reference=train_ds)

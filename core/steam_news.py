@@ -80,7 +80,7 @@ def fetch_steam_news(count: int = 10, timeout: float = 6.0) -> List[Dict[str, An
                 _cached_news = news
                 _last_fetch_time = now
                 return news
-    except Exception as e:
+    except Exception:
         # If fetch fails, return cached if available or fallback
         if _cached_news:
             return _cached_news

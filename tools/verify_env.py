@@ -10,7 +10,6 @@ the upstream per-ticker path, and reports the timing difference.
 """
 import json
 import os
-import statistics
 import sys
 import time
 

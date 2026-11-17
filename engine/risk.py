@@ -36,7 +36,7 @@ def record_trade_outcome(state: AppState, ticker: str, realized_dollar: float, r
                     ticker="PORTFOLIO",
                     action="CIRCUIT_BREAKER",
                     mode=state.mode,
-                    reason=f"3 consecutive losses detected. 60s cooldown engaged to protect capital.",
+                    reason="3 consecutive losses detected. 60s cooldown engaged to protect capital.",
                     status="ACTIVE"
                 )
 

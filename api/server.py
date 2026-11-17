@@ -1,5 +1,4 @@
 import os
-import sys
 import io
 import csv
 import time
@@ -40,12 +39,9 @@ from engine.ml_engine import LocalModelEngine, run_retrain_pipeline, start_auto_
 from engine.latency import PIPELINE, timed
 from engine.bridge import (
     fetch_snapshot,
-    fetch_snapshot_http,
     fetch_snapshot_change,
     dispatch_order,
-    dispatch_order_http,
     run_auto_installer,
-    check_bridge_health,
     FILE_WATCHER,
 )
 from engine.strategy import evaluate_portfolio, execute_orders_batch, record_trade_in_proto, start_tick_storage_worker
@@ -55,6 +51,12 @@ import otostoks_proto as pb
 def create_app(state: AppState) -> FastAPI:
     active_websockets: List[WebSocket] = []
     ws_lock = asyncio.Lock()
+
+    async def refresh_process_state():
+        """Runs the (slow) process lookup off the loop and publishes the result."""
+        is_running, pid = await asyncio.to_thread(check_game_process)
+        state.game_running = is_running
+        state.game_pid = pid
 
     async def broadcast_state():
         if not active_websockets:
@@ -96,15 +98,15 @@ def create_app(state: AppState) -> FastAPI:
             cycle_start = time.perf_counter()
             now = time.time()
 
-            # Process status check every 2 s. tasklist spawns a process, and this used
-            # to run directly on the event loop thread: every 2 s the loop stalled for
-            # tens of milliseconds, delaying in-flight orders and websocket traffic.
-            # Skipped on the first iteration so a slow probe cannot delay frame one.
-            if iteration > 0 and (now - last_process_check) >= PROCESS_CHECK_INTERVAL_S:
+            # Process status check, at most once every 2 s. tasklist spawns a
+            # process (measured 45 ms filtered, 158 ms unfiltered), so it runs in a
+            # worker thread and the loop never awaits it: awaiting put the cost
+            # straight into the frame cycle, which showed up as a 155 ms p95.
+            # While the export feed is live the game is demonstrably running, so
+            # there is nothing to discover and the check is skipped entirely.
+            if iteration > 0 and not state.connected and (now - last_process_check) >= PROCESS_CHECK_INTERVAL_S:
                 last_process_check = now
-                is_running, pid = await asyncio.to_thread(check_game_process)
-                state.game_running = is_running
-                state.game_pid = pid
+                asyncio.create_task(refresh_process_state())
 
             # Auto Mode Time Limit Check (Never liquidates on timeout!)
             if state.mode == "AUTO":
@@ -135,7 +137,7 @@ def create_app(state: AppState) -> FastAPI:
             # republishes market.json about once per second (measured median 1002 ms),
             # so an unchanged file costs one stat() and the loop yields again.
             with timed("snapshot_wait"):
-                changed, data, age_ms = await asyncio.to_thread(fetch_snapshot_change, iteration > 0)
+                changed, data, age_ms = await asyncio.to_thread(fetch_snapshot_change)
             iteration += 1
 
             if not changed:
@@ -178,6 +180,10 @@ def create_app(state: AppState) -> FastAPI:
                     reason=f"Synchronized with {trans_label}",
                     status="ONLINE"
                 )
+                # The periodic process check is skipped while the feed is healthy,
+                # so fill in the PID once here for the dashboard.
+                if state.game_pid is None:
+                    asyncio.create_task(refresh_process_state())
 
             # Sync unlocked universe
             raw_unlocked = set(data.get("unlockedStocks", []))

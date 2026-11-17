@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -159,6 +160,88 @@ class MarketFileWatcherTests(unittest.TestCase):
         self.game.write_market(build_market_frame())
         _, _, age = self.watcher.poll()
         self.assertFalse(self.watcher.is_stale(age))
+
+
+class TransientLockTests(unittest.TestCase):
+    """
+    The game rewrites market.json with exclusive access about once per second, so
+    a single failed open is routine. Treating it as "no data, no age" made the
+    caller declare the feed dead and reconnect on every tick.
+    """
+
+    def setUp(self):
+        self.game = FakeGameDir()
+        self.path = self.game.write_market(build_market_frame(price=14.0))
+        self.watcher = MarketFileWatcher(game_dir=self.game.root)
+
+    def tearDown(self):
+        self.game.cleanup()
+
+    def test_sharing_violation_is_not_reported_as_stale(self):
+        real_open = open
+        attempts = {"n": 0}
+        target = os.path.abspath(self.path)
+
+        def flaky_open(file, *args, **kwargs):
+            if os.path.abspath(str(file)) == target:
+                attempts["n"] += 1
+                raise PermissionError(13, "The process cannot access the file", str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch("builtins.open", flaky_open):
+            changed, snap, age = self.watcher.poll()
+
+        self.assertFalse(changed)
+        self.assertIsNone(snap)
+        # A real age, not None: the file exists and is fresh, we just could not
+        # read it this instant.
+        self.assertIsNotNone(age)
+        self.assertFalse(self.watcher.is_stale(age))
+        self.assertGreaterEqual(attempts["n"], 2, "the read should be retried")
+
+    def test_frame_is_picked_up_after_the_lock_clears(self):
+        real_open = open
+        target = os.path.abspath(self.path)
+        state = {"locked": True}
+
+        def flaky_open(file, *args, **kwargs):
+            if state["locked"] and os.path.abspath(str(file)) == target:
+                raise PermissionError(13, "The process cannot access the file", str(file))
+            return real_open(file, *args, **kwargs)
+
+        with mock.patch("builtins.open", flaky_open):
+            self.watcher.poll()
+            state["locked"] = False
+            changed, snap, age = self.watcher.poll()
+
+        self.assertTrue(changed)
+        self.assertEqual(snap["stocks"]["$BANK"]["price"], 14.0)
+        self.assertFalse(self.watcher.is_stale(age))
+
+    def test_missing_export_is_stale(self):
+        os.remove(self.path)
+        changed, snap, age = self.watcher.poll()
+        self.assertFalse(changed)
+        self.assertIsNone(age)
+        self.assertTrue(self.watcher.is_stale(age))
+
+    def test_recent_good_read_keeps_an_unreadable_file_healthy(self):
+        """
+        A frame that was parsed a moment ago keeps the feed healthy while the file
+        is briefly unreadable, which happens once per publish on Windows.
+        """
+        self.game.write_market(build_market_frame())
+        self.watcher.poll()
+        # No age available (e.g. the stat itself failed for one poll).
+        self.assertFalse(self.watcher.is_stale(None))
+
+    def test_old_file_is_stale_even_though_it_was_just_read(self):
+        path = self.game.write_market(build_market_frame())
+        old = time.time() - 30
+        os.utime(path, (old, old))
+        _, _, age = self.watcher.poll()
+        self.assertGreater(age, 5000)
+        self.assertTrue(self.watcher.is_stale(age))
 
 
 class NativeOrderTests(unittest.TestCase):

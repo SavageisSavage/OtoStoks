@@ -9,14 +9,11 @@ from typing import Dict, Any, Optional, Tuple
 
 from core.config import (
     get_base_dir,
-    check_game_process,
     COMMAND_CONFIRM_TIMEOUT_MS,
     HTTP_BRIDGE_BACKOFF_S,
     SNAPSHOT_STALE_S,
 )
 from core.game_mod import (
-    find_game_dir,
-    get_game_paths,
     ensure_native_mod_support,
     read_native_market_file,
     dispatch_native_order,
@@ -35,6 +32,10 @@ _http_fails: int = 0
 _http_backoff_until: float = 0.0
 _http_backoff_s: float = HTTP_BRIDGE_BACKOFF_S
 _HTTP_BACKOFF_MAX_S: float = 60.0
+
+# When this module was loaded. Used to give the file export a short grace period
+# before the socket bridge is probed for the first time.
+_STARTED_AT: float = time.time()
 
 # Shared change-driven reader for the native export file.
 FILE_WATCHER = MarketFileWatcher()
@@ -107,7 +108,7 @@ def run_auto_installer() -> Tuple[bool, str]:
             active_dest = next((p for p in dest_candidates if os.path.exists(p)), dest_candidates[0])
             try:
                 shutil.copy2(src_dll, active_dest)
-                dll_msg = f"OtoStoksBridge DLL synced."
+                dll_msg = "OtoStoksBridge DLL synced."
             except Exception:
                 dll_msg = "Bridge DLL already loaded in game."
         except Exception as e:
@@ -180,7 +181,7 @@ def fetch_snapshot(host: str = "127.0.0.1", port: int = 8765) -> Optional[Dict[s
     return None
 
 
-def fetch_snapshot_change(allow_http: bool = True) -> Tuple[bool, Optional[Dict[str, Any]], Optional[float]]:
+def fetch_snapshot_change() -> Tuple[bool, Optional[Dict[str, Any]], Optional[float]]:
     """
     Change-driven variant of fetch_snapshot() for the main loop.
 
@@ -190,21 +191,33 @@ def fetch_snapshot_change(allow_http: bool = True) -> Tuple[bool, Optional[Dict[
     The HTTP bridge exposes no file signature, so when it is live every call is
     treated as a new frame.
 
-    allow_http=False skips the bridge probe for one iteration, so the first native
-    frame is not delayed by a probe that usually costs a socket timeout.
+    The file export is polled first and the socket bridge is only probed once the
+    export has gone quiet. Probing a bridge that is not installed costs a socket
+    connect (measured 600 ms with the port filtered), and doing that on a timer
+    while the native feed was healthy produced a ~600 ms stall on roughly one
+    frame per minute.
     """
     global CURRENT_TRANSPORT
-
-    if allow_http:
-        snap = fetch_snapshot_http(timeout=0.6)
-        if snap and snap.get("marketReady", False):
-            CURRENT_TRANSPORT = "http"
-            return True, snap, 0.0
 
     changed, native_snap, age_ms = FILE_WATCHER.poll()
     if changed and native_snap:
         CURRENT_TRANSPORT = "native_mod"
         return True, native_snap, age_ms
+
+    # The native export is the primary transport: it is the one the game always
+    # writes when mod support is on. Only fall back to the socket bridge when the
+    # file feed has actually gone quiet, so a healthy feed never pays for a probe.
+    #
+    # While nothing has ever been parsed, hold off for the staleness window: a
+    # probe that finds nothing costs the full socket timeout (measured 615 ms), and
+    # paying that on frame one is worse than reacting 10 ms later.
+    if FILE_WATCHER.is_stale(age_ms):
+        grace_over = (time.time() - _STARTED_AT) >= SNAPSHOT_STALE_S
+        if FILE_WATCHER.frames > 0 or grace_over:
+            snap = fetch_snapshot_http(timeout=0.6)
+            if snap and snap.get("marketReady", False):
+                CURRENT_TRANSPORT = "http"
+                return True, snap, 0.0
 
     return False, None, age_ms
 
@@ -292,7 +305,6 @@ def dispatch_order(order_payload: Dict[str, Any], host: str = "127.0.0.1", port:
     Universal order dispatcher:
     Uses HTTP bridge if current transport is HTTP; otherwise uses Native Mod command files.
     """
-    global CURRENT_TRANSPORT
     ticker = order_payload.get("ticker", "")
     action = order_payload.get("action", "")
     amount = order_payload.get("amount", "max")

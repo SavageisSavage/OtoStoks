@@ -289,7 +289,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 
         <!-- Engine Latency & Mode Badge -->
         <div class="hidden md:flex items-center gap-2 text-xs text-muted">
-          <span>Latency: <strong id="latencyDisplay" class="text-title tabular">0.12 ms</strong></span>
+          <span id="latencyWrap" title="Median time from a new market frame to decisions being dispatched">
+            Cycle: <strong id="latencyDisplay" class="text-title tabular">--</strong>
+          </span>
           <span class="text-dim">|</span>
           <span id="modeBadge" class="px-2 py-0.5 rounded text-[11px] font-medium badge-neutral">SUGGESTION MODE</span>
         </div>
@@ -2024,10 +2026,23 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         }
       }
 
-      // Latency Display
+      // Latency Display. Shows the median frame-to-decision cycle, because that
+      // is the number that bounds how stale a signal can be when it reaches the
+      // game; inference alone is only a slice of it. The per-stage p50s go in the
+      // tooltip so the breakdown is visible without cluttering the header.
       const latEl = document.getElementById('latencyDisplay');
-      if (latEl && data.inf_latency_ms !== undefined) {
-        latEl.innerText = `${Number(data.inf_latency_ms).toFixed(2)} ms`;
+      if (latEl) {
+        const p = data.pipeline || {};
+        const hasCycle = p.cycle && p.cycle.n;
+        const shown = hasCycle ? p.cycle.p50 : (data.inf_latency_ms || 0);
+        latEl.innerText = `${Number(shown).toFixed(2)} ms`;
+        const stages = ['snapshot_wait', 'features', 'inference', 'decision', 'dispatch']
+          .filter(k => p[k] && p[k].n)
+          .map(k => `${k} ${Number(p[k].p50).toFixed(2)} ms`);
+        const tip = stages.length ? `median ms per stage (p50)\n${stages.join('\n')}` : '';
+        latEl.title = tip;
+        const wrap = document.getElementById('latencyWrap');
+        if (wrap && tip) wrap.title = tip;
       }
 
       // Special BASE Crash Indicator

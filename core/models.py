@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any, List
+from typing import Optional
 from pydantic import BaseModel, Field
 
 class ManualTradePayload(BaseModel):

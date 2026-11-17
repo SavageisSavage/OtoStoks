@@ -12,7 +12,7 @@ from core.config import (
     SIGNAL_STRONG_SHORT
 )
 from core.state import AppState
-from engine.bridge import dispatch_order, dispatch_order_http
+from engine.bridge import dispatch_order
 from engine.risk import (
     record_trade_outcome,
     is_entry_allowed,
@@ -142,7 +142,6 @@ def evaluate_portfolio(state: AppState, signals: Dict[str, Dict[str, Any]], tick
         state.is_base_crash_active = is_crash
         state.base_crash_countdown_str = crash_countdown
 
-    stop_loss_enabled = state.settings.get("stop_loss_enabled", True)
     stop_loss_pct = state.settings.get("stop_loss_pct", 15.0)
     take_profit_enabled = state.settings.get("take_profit_enabled", True)
     min_profit_pct = state.settings.get("min_profit_pct", 6.0)
