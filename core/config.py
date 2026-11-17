@@ -1,0 +1,135 @@
+import os
+import sys
+import socket
+import subprocess
+from typing import Tuple, Dict, Any, Optional
+
+STEAM_APP_ID = "4356780"
+
+# Quantitative Signal Constants
+SIGNAL_STRONG_BUY = 2
+SIGNAL_BUY = 1
+SIGNAL_NEUTRAL = 0
+SIGNAL_SHORT = -1
+SIGNAL_STRONG_SHORT = -2
+
+# Preset Configuration Profiles
+PRESET_PROFILES: Dict[str, Dict[str, Any]] = {
+    "TURBO": {
+        "max_alloc_pct": 85.0,
+        "stop_loss_pct": 15.0,
+        "min_profit_pct": 6.0,
+        "tech_target_x": 16.0,
+        "max_positions": 5,
+        "kelly_mult": 0.40,
+        "description": "High-velocity compound snowball for accelerating early capital"
+    },
+    "GROWTH": {
+        "max_alloc_pct": 40.0,
+        "stop_loss_pct": 12.0,
+        "min_profit_pct": 8.0,
+        "tech_target_x": 18.0,
+        "max_positions": 6,
+        "kelly_mult": 0.25,
+        "description": "Balanced trend continuation and alpha harvesting"
+    },
+    "DEFENSIVE": {
+        "max_alloc_pct": 15.0,
+        "stop_loss_pct": 4.0,
+        "min_profit_pct": 4.0,
+        "tech_target_x": 15.0,
+        "max_positions": 3,
+        "kelly_mult": 0.12,
+        "description": "Strict capital shield with low drawdown tolerance"
+    },
+    "BILLIONAIRE": {
+        "max_alloc_pct": 100.0,
+        "stop_loss_enabled": False,
+        "take_profit_enabled": False,
+        "max_positions": 10,
+        "kelly_mult": 0.50,
+        "description": "Permanent dividend holding vault collecting compound interest per minute"
+    }
+}
+
+
+def get_base_dir() -> str:
+    """Returns application base directory, supporting PyInstaller bundles."""
+    return getattr(sys, '_MEIPASS', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def get_protobuf_paths() -> Tuple[str, str]:
+    """Returns absolute paths to ticks and trades protobuf files."""
+    base_dir = get_base_dir()
+    data_dir = os.path.join(base_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    ticks_pb = os.path.join(data_dir, "otostoks_ticks.pb")
+    trades_pb = os.path.join(data_dir, "otostoks_trades.pb")
+    return ticks_pb, trades_pb
+
+
+def get_settings_path() -> str:
+    """Returns absolute path to persistent settings JSON file."""
+    base_dir = get_base_dir()
+    data_dir = os.path.join(base_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "settings.json")
+
+
+def get_model_path() -> str:
+    """Finds active ONNX model across search candidates."""
+    base_dir = get_base_dir()
+    candidates = [
+        os.path.join(base_dir, "model.onnx"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model.onnx"),
+        r"C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\model.onnx"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return os.path.join(base_dir, "model.onnx")
+
+
+def find_available_port(preferred_port: int = 8080) -> int:
+    """Finds an available local port starting from preferred_port without terminating other apps."""
+    for p in range(preferred_port, preferred_port + 50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(('127.0.0.1', p))
+                return p
+            except OSError:
+                continue
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def check_game_process() -> Tuple[bool, Optional[int]]:
+    """Checks if the Screen Stocks game executable is running."""
+    if sys.platform != "win32":
+        return False, None
+    try:
+        out = subprocess.check_output('tasklist /FO CSV /NH', shell=True, text=True, stderr=subprocess.DEVNULL)
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2:
+                pname = parts[0].lower()
+                pid_str = parts[1]
+                if pname in ("screen stocks.exe", "screenstocks.exe", "screen_stocks.exe"):
+                    if pid_str.isdigit():
+                        return True, int(pid_str)
+    except Exception:
+        pass
+    return False, None
+
+
+def launch_screen_stocks() -> Tuple[bool, str]:
+    """Launches Screen Stocks via Steam protocol URL."""
+    try:
+        import webbrowser
+        webbrowser.open(f"steam://rungameid/{STEAM_APP_ID}")
+        return True, "Launched Screen Stocks via Steam"
+    except Exception as e:
+        return False, str(e)

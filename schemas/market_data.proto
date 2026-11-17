@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package otostoks;
+
+// Individual market tick captured from Screen Stocks game bridge
+message MarketTick {
+  string ticker = 1;
+  int64 timestamp_ms = 2;
+  double price = 3;
+  double volume = 4;
+  string holding = 5;
+  double avg_price = 6;
+  double unrealized_pnl = 7;
+  double dividend_rate = 8;
+  string profile = 9;
+}
+
+// Batch of collected ticks streamed to disk with high efficiency
+message MarketTickBatch {
+  int64 batch_id = 1;
+  int64 created_at = 2;
+  repeated MarketTick ticks = 3;
+  int32 tick_count = 4;
+}
+
+// Completed trade execution record for persistent audit ledger
+message TradeRecord {
+  int64 trade_id = 1;
+  int64 timestamp = 2;
+  string ticker = 3;
+  string action = 4;
+  double price = 5;
+  int64 amount = 6;
+  double profit_pct = 7;
+  string reason = 8;
+}
