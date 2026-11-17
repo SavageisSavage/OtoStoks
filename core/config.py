@@ -6,6 +6,23 @@ from typing import Tuple, Dict, Any, Optional
 
 STEAM_APP_ID = "4356780"
 
+# ------------------------------------------------------------------------------
+# Latency tunables
+#
+# The game republishes mods/export/market.json roughly once per second (median
+# 1002 ms, p95 1058 ms, measured from history.json). Polling faster than that
+# only re-parses an unchanged 34 KB JSON document, so the loop is driven by the
+# file's mtime instead of a fixed sleep.
+# ------------------------------------------------------------------------------
+POLL_IDLE_S = 0.01                 # idle poll when the game has not written a new frame
+SNAPSHOT_STALE_S = 5.0             # treat the feed as lost after this long without a write
+BROADCAST_IDLE_S = 0.5             # refresh the dashboard at least this often while idle
+PROCESS_CHECK_INTERVAL_S = 2.0     # how often to ask tasklist whether the game runs
+HTTP_BRIDGE_BACKOFF_S = 15.0       # skip the HTTP probe this long after repeated refusals
+HTTP_BRIDGE_FAILS_BEFORE_BACKOFF = 3
+COMMAND_CONFIRM_TIMEOUT_MS = 2000  # max wait for the game to consume a command file
+COMMAND_CONFIRM_POLL_MS = 5        # polling granularity while confirming an order
+
 # Quantitative Signal Constants
 SIGNAL_STRONG_BUY = 2
 SIGNAL_BUY = 1
@@ -77,12 +94,20 @@ def get_settings_path() -> str:
 
 
 def get_model_path() -> str:
-    """Finds active ONNX model across search candidates."""
+    """Finds the active ONNX model.
+
+    Order: OTOSTOKS_MODEL override, then the app directory, then the repository
+    root (source checkout). The path is resolved at runtime rather than patched
+    to a developer's machine, so a checkout works from any location.
+    """
+    override = os.environ.get("OTOSTOKS_MODEL")
+    if override and os.path.exists(override):
+        return os.path.abspath(override)
+
     base_dir = get_base_dir()
     candidates = [
         os.path.join(base_dir, "model.onnx"),
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "model.onnx"),
-        r"C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\model.onnx"
     ]
     for c in candidates:
         if os.path.exists(c):

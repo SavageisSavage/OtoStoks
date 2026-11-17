@@ -3,7 +3,7 @@ import sys
 import time
 import threading
 from datetime import datetime
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, List
 import numpy as np
 
 try:
@@ -46,30 +46,30 @@ class LocalModelEngine:
         if onnx_path and os.path.exists(onnx_path) and HAS_ORT:
             try:
                 opts = ort.SessionOptions()
-                opts.intra_op_num_threads = 2
+                # The model is a small tree ensemble (16 features). Extra intra-op
+                # threads cost more in synchronisation than they save, and they
+                # contend with the game process on the same cores.
+                opts.intra_op_num_threads = 1
+                opts.inter_op_num_threads = 1
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
                 self.session = ort.InferenceSession(onnx_path, sess_options=opts, providers=['CPUExecutionProvider'])
                 self.input_name = self.session.get_inputs()[0].name
             except Exception:
                 self.session = None
 
-    def predict(self, feat: np.ndarray) -> Tuple[float, int, float, str]:
-        """
-        Evaluates 16-factor vector via ONNX & analytical ensemble.
-        Returns: (expected_return, signal_code, confidence, regime)
-        """
-        if len(feat) < 16:
-            f16 = np.zeros(16, dtype=np.float32)
-            f16[:min(16, len(feat))] = feat[:min(16, len(feat))]
-            feat = f16
+    def _run_session(self, feats: np.ndarray) -> Optional[np.ndarray]:
+        """Runs one ONNX call for an (n, 16) batch. Returns (n,) expected returns."""
+        if self.session is None or not self.input_name or len(feats) == 0:
+            return None
+        try:
+            batch = np.ascontiguousarray(feats, dtype=np.float32)
+            raw = self.session.run(None, {self.input_name: batch})[0]
+            return np.asarray(raw).reshape(-1).astype(np.float64)
+        except Exception:
+            return None
 
-        expected_ret = None
-        if self.session is not None and self.input_name:
-            try:
-                raw = self.session.run(None, {self.input_name: np.expand_dims(feat, axis=0)})[0]
-                expected_ret = float(raw[0][0])
-            except Exception:
-                pass
-
+    def _score(self, feat: np.ndarray, expected_ret: Optional[float]) -> Tuple[float, int, float, str]:
+        """Analytical factor scoring for one already-computed feature vector."""
         ema_spread = float(feat[0])
         rsi14 = float(feat[1])
         bb_pct = float(feat[2])
@@ -137,6 +137,41 @@ class LocalModelEngine:
             confidence = 0.20
 
         return expected_ret, signal, confidence, regime
+
+    def _normalise(self, feats: np.ndarray) -> np.ndarray:
+        arr = np.asarray(feats, dtype=np.float32)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, -1)
+        if arr.shape[1] < 16:
+            padded = np.zeros((arr.shape[0], 16), dtype=np.float32)
+            padded[:, :arr.shape[1]] = arr
+            arr = padded
+        elif arr.shape[1] > 16:
+            arr = arr[:, :16]
+        return arr
+
+    def predict(self, feat: np.ndarray) -> Tuple[float, int, float, str]:
+        """
+        Evaluates 16-factor vector via ONNX & analytical ensemble.
+        Returns: (expected_return, signal_code, confidence, regime)
+        """
+        return self.predict_batch(np.asarray(feat).reshape(1, -1))[0]
+
+    def predict_batch(self, feats: np.ndarray) -> List[Tuple[float, int, float, str]]:
+        """
+        Evaluates every ticker's feature vector in a single ONNX call.
+
+        Upstream called session.run() once per ticker (17 calls per frame). A tree
+        ensemble has a fixed per-call overhead that dwarfs the work, so batching
+        the whole universe into one (n, 16) tensor removes it.
+        """
+        arr = self._normalise(feats)
+        raw = self._run_session(arr)
+        results: List[Tuple[float, int, float, str]] = []
+        for i in range(arr.shape[0]):
+            expected = float(raw[i]) if raw is not None and i < len(raw) else None
+            results.append(self._score(arr[i], expected))
+        return results
 
 
 def run_retrain_pipeline(state: AppState) -> Tuple[bool, str]:

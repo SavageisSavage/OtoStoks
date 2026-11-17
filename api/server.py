@@ -16,7 +16,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from core.models import ManualTradePayload, SettingsPayload, PresetPayload
 from core.state import AppState
-from core.config import get_base_dir, get_model_path, launch_screen_stocks, check_game_process
+from core.config import (
+    get_base_dir,
+    get_model_path,
+    launch_screen_stocks,
+    check_game_process,
+    BROADCAST_IDLE_S,
+    POLL_IDLE_S,
+    PROCESS_CHECK_INTERVAL_S,
+)
 from core.steam_news import fetch_steam_news, start_steam_news_poller
 from core.game_mod import (
     read_in_game_settings,
@@ -29,13 +37,16 @@ from core.game_mod import (
 from ui.dashboard import DASHBOARD_HTML
 from engine.features import FastFeatureTracker
 from engine.ml_engine import LocalModelEngine, run_retrain_pipeline, start_auto_retrain_worker
+from engine.latency import PIPELINE, timed
 from engine.bridge import (
     fetch_snapshot,
     fetch_snapshot_http,
+    fetch_snapshot_change,
     dispatch_order,
     dispatch_order_http,
     run_auto_installer,
-    check_bridge_health
+    check_bridge_health,
+    FILE_WATCHER,
 )
 from engine.strategy import evaluate_portfolio, execute_orders_batch, record_trade_in_proto, start_tick_storage_worker
 import otostoks_proto as pb
@@ -76,16 +87,20 @@ def create_app(state: AppState) -> FastAPI:
         start_steam_news_poller(state)
 
         last_process_check = 0.0
+        last_broadcast = 0.0
         prev_cash: Optional[float] = None
         prev_ipo: Optional[int] = None
 
         while state.running:
+            cycle_start = time.perf_counter()
             now = time.time()
 
-            # Process status check every 2 seconds
-            if (now - last_process_check) >= 2.0:
+            # Process status check every 2 s. tasklist spawns a process, and this used
+            # to run directly on the event loop thread: every 2 s the loop stalled for
+            # tens of milliseconds, delaying in-flight orders and websocket traffic.
+            if (now - last_process_check) >= PROCESS_CHECK_INTERVAL_S:
                 last_process_check = now
-                is_running, pid = check_game_process()
+                is_running, pid = await asyncio.to_thread(check_game_process)
                 state.game_running = is_running
                 state.game_pid = pid
 
@@ -114,13 +129,37 @@ def create_app(state: AppState) -> FastAPI:
             else:
                 state.auto_time_remaining_str = "Inactive (Suggestion Mode)"
 
-            # Poll snapshot directly from universal bridge (HTTP or Native Mod)
-            data = await asyncio.to_thread(fetch_snapshot)
+            # Wait for a NEW market frame. There is no fixed 120 ms sleep: the game
+            # republishes market.json about once per second (measured median 1002 ms),
+            # so an unchanged file costs one stat() and the loop yields again.
+            with timed("snapshot_wait"):
+                changed, data, age_ms = await asyncio.to_thread(fetch_snapshot_change)
+
+            if not changed:
+                if state.connected and FILE_WATCHER.is_stale(age_ms):
+                    state.connected = False
+                    state.game_bridge_connected = False
+                    state.add_log(
+                        ticker="BRIDGE",
+                        action="STALE",
+                        mode=state.mode,
+                        reason="Screen Stocks stopped publishing market data",
+                        status="OFFLINE"
+                    )
+                if (time.time() - last_broadcast) >= BROADCAST_IDLE_S:
+                    last_broadcast = time.time()
+                    state.pipeline_metrics = PIPELINE.snapshot()
+                    await broadcast_state()
+                await asyncio.sleep(POLL_IDLE_S)
+                continue
+
             if data is None or not data.get("marketReady", False):
                 state.connected = False
                 state.game_bridge_connected = False
-                await asyncio.sleep(0.4)
+                await asyncio.sleep(0.05)
                 continue
+
+            state.last_update_time = time.time()
 
             state.bridge_transport = data.get("source", "native_mod")
 
@@ -183,10 +222,14 @@ def create_app(state: AppState) -> FastAPI:
 
             stocks_data = data.get("stocks", {})
             signals = {}
-            inf_times = []
             timestamp_str = datetime.now().strftime("%H:%M:%S")
             state.history_timestamps.append(timestamp_str)
 
+            # Pass 1: roll each ticker forward and build its feature vector.
+            pending = []
+            feat_rows = []
+            feat_slot = {}
+            t_feat = time.perf_counter()
             for ticker, s in stocks_data.items():
                 if state.unlocked_stocks and ticker not in state.unlocked_stocks:
                     continue
@@ -201,14 +244,28 @@ def create_app(state: AppState) -> FastAPI:
                 state.rolling_prices[ticker].append(curr_price)
 
                 # Unified 16-feature calculation (requires >= 30 ticks)
-                t_inf_start = time.perf_counter()
                 feat = tracker.update(ticker, curr_price)
+                slot = len(pending)
+                pending.append((ticker, s, feat, curr_price))
                 if feat is not None:
-                    exp_ret, sig, conf, regime = model.predict(feat)
+                    feat_slot[slot] = len(feat_rows)
+                    feat_rows.append(feat)
+            PIPELINE.record("features", (time.perf_counter() - t_feat) * 1000.0)
+
+            # Pass 2: one ONNX call for the whole universe instead of one per ticker.
+            t_inf = time.perf_counter()
+            predictions = model.predict_batch(feat_rows) if feat_rows else []
+            inf_ms = (time.perf_counter() - t_inf) * 1000.0
+            PIPELINE.record("inference", inf_ms)
+            if feat_rows:
+                state.inf_latency_ms = inf_ms / len(feat_rows)
+
+            for slot, (ticker, s, feat, curr_price) in enumerate(pending):
+                if feat is not None and slot in feat_slot:
+                    exp_ret, sig, conf, regime = predictions[feat_slot[slot]]
                     vol = float(feat[4])
                 else:
                     exp_ret, sig, conf, regime, vol = 0.0, 0, 0.0, "INITIALIZING", 0.015
-                inf_times.append((time.perf_counter() - t_inf_start) * 1000.0)
 
                 signals[ticker] = {
                     "signal": sig,
@@ -252,16 +309,15 @@ def create_app(state: AppState) -> FastAPI:
                     "sparkline": list(state.history_series[ticker])[-20:]
                 }
 
-            if inf_times:
-                state.inf_latency_ms = sum(inf_times) / len(inf_times)
-
             # Evaluate Portfolio
-            orders = evaluate_portfolio(state, signals, data)
+            with timed("decision"):
+                orders = evaluate_portfolio(state, signals, data)
 
             if orders:
                 if state.mode == "AUTO":
                     # Dispatches independent stocks in parallel, sequential reversals per stock
-                    await execute_orders_batch(state, orders, stocks_data)
+                    with timed("dispatch"):
+                        await execute_orders_batch(state, orders, stocks_data)
                 else:
                     for order in orders:
                         state.add_log(
@@ -272,8 +328,12 @@ def create_app(state: AppState) -> FastAPI:
                             status="RECOMMENDED"
                         )
 
+            PIPELINE.record("cycle", (time.perf_counter() - cycle_start) * 1000.0)
+            state.pipeline_metrics = PIPELINE.snapshot()
+            last_broadcast = time.time()
             await broadcast_state()
-            await asyncio.sleep(0.12)
+            # Yield, then block on the next frame instead of a fixed 120 ms sleep.
+            await asyncio.sleep(0)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):

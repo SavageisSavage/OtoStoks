@@ -14,8 +14,20 @@ import re
 import shutil
 from typing import Dict, Any, List, Optional, Tuple
 
+from core.config import (
+    COMMAND_CONFIRM_POLL_MS,
+    COMMAND_CONFIRM_TIMEOUT_MS,
+    SNAPSHOT_STALE_S,
+)
+
 APP_ID = 4356780
 SAV_NAME = "thesmallshort_online_settings.sav"
+
+# Resolving the game directory costs several filesystem probes on every call, and
+# the loop used to call it 3-4 times per frame. Cache the answer briefly so a
+# game install/uninstall is still picked up without paying for it every tick.
+_PATH_CACHE_TTL_S = 5.0
+_path_cache: Dict[str, Any] = {"game_dir": None, "ts": 0.0}
 
 
 def find_game_dir() -> Optional[str]:
@@ -44,7 +56,18 @@ def find_game_dir() -> Optional[str]:
 
 def get_game_paths(game_dir: Optional[str] = None) -> Dict[str, str]:
     """Returns mapped paths for game save, mods, market export, and commands."""
-    gdir = game_dir or find_game_dir() or ""
+    if game_dir is not None:
+        gdir = game_dir
+    else:
+        now = time.time()
+        cached = _path_cache.get("game_dir")
+        if cached and (now - float(_path_cache.get("ts") or 0.0)) < _PATH_CACHE_TTL_S:
+            gdir = cached
+        else:
+            gdir = find_game_dir() or ""
+            _path_cache["game_dir"] = gdir
+            _path_cache["ts"] = now
+
     mods_dir = os.path.join(gdir, "mods") if gdir else ""
     return {
         "game_dir": gdir,
@@ -127,18 +150,25 @@ def read_native_market_file(game_dir: Optional[str] = None) -> Optional[Dict[str
         return None
 
     try:
-        # Check mtime to avoid reading partially written files
-        mtime = os.path.getmtime(mfile)
-        if time.time() - mtime > 15.0:
-            # File is stale (game paused or closed)
-            pass
-
         with open(mfile, "r", encoding="utf-8", errors="ignore") as f:
             data = json.load(f)
+    except Exception:
+        return None
 
-        if not data or not data.get("marketReady", True):
-            return None
+    return normalise_market_data(data)
 
+
+def normalise_market_data(data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Converts a raw market.json payload into the engine's unified snapshot shape.
+
+    Split out from the file reader so the change watcher can normalise a buffer it
+    has already read, instead of the file being opened and parsed twice per frame.
+    """
+    if not data or not data.get("marketReady", True):
+        return None
+
+    try:
         # Transform to unified snapshot dictionary
         stocks_dict = {}
         for s in data.get("stocks", []):
@@ -218,35 +248,45 @@ def read_native_market_file(game_dir: Optional[str] = None) -> Optional[Dict[str
         return None
 
 
-def dispatch_native_order(ticker: str, action: str, amount_or_pct: Any, is_max: bool = True, game_dir: Optional[str] = None) -> Tuple[bool, str]:
+def dispatch_native_order(ticker: str, action: str, amount_or_pct: Any, is_max: bool = True, game_dir: Optional[str] = None) -> Tuple[bool, str, Optional[str]]:
     """
     Dispatches order via Screen Stocks official mods/commands/<stockId>/ directory:
     - Writes buymax.json / buypercent.json, sellmax.json / sellpercent.json, etc.
     - Format: {"execute": true} or {"execute": true, "percent": 50}
+
+    Returns (ok, message, command_file_path). The caller can pass the path to
+    wait_command_consumed() to learn the exact moment the game picked the order
+    up, instead of guessing with a fixed sleep.
     """
     paths = get_game_paths(game_dir)
     cmds_dir = paths["commands"]
     if not cmds_dir or not os.path.exists(cmds_dir):
-        return False, "Mods commands directory does not exist. Ensure Screen Stocks is open with mod support."
+        return False, "Mods commands directory does not exist. Ensure Screen Stocks is open with mod support.", None
 
     stock_dir = os.path.join(cmds_dir, ticker)
-    os.makedirs(stock_dir, exist_ok=True)
+    try:
+        os.makedirs(stock_dir, exist_ok=True)
+    except Exception as e:
+        return False, f"Could not create command directory for {ticker}: {e}", None
 
     act = action.lower()
     if act not in ("buy", "sell", "short", "cover", "close"):
-        return False, f"Unknown trade action: {action}"
+        return False, f"Unknown trade action: {action}", None
 
     filename = f"{act}max.json" if is_max else f"{act}percent.json"
     filepath = os.path.join(stock_dir, filename)
 
     try:
-        # Check if already executing
+        # A leftover execute=true means the game has not consumed the previous
+        # order yet. Give it a short grace window instead of rejecting outright,
+        # which is what caused missed entries right after a reversal.
         if os.path.exists(filepath):
             try:
                 with open(filepath, "r", encoding="utf-8") as f:
                     cur = json.load(f)
                 if cur.get("execute") is True:
-                    return False, f"Previous {action} order for {ticker} is still pending game pickup."
+                    if wait_command_consumed(filepath, timeout_ms=250) is None:
+                        return False, f"Previous {action} order for {ticker} is still pending game pickup.", filepath
             except Exception:
                 pass
 
@@ -261,9 +301,127 @@ def dispatch_native_order(ticker: str, action: str, amount_or_pct: Any, is_max: 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
-        return True, f"Native mod order {action.upper()} dispatched to {filepath}"
+        return True, f"Native mod order {action.upper()} dispatched to {filepath}", filepath
     except Exception as e:
-        return False, f"Failed writing native mod order: {e}"
+        return False, f"Failed writing native mod order: {e}", None
+
+
+def wait_command_consumed(filepath: Optional[str], timeout_ms: int = COMMAND_CONFIRM_TIMEOUT_MS,
+                          poll_ms: int = COMMAND_CONFIRM_POLL_MS) -> Optional[float]:
+    """
+    Waits for the game to consume a command file.
+
+    The game acknowledges an order by flipping "execute" back to false (or by
+    replacing/removing the file). Watching for that transition is both faster and
+    more accurate than sleeping for a guessed interval, and it measures real order
+    pickup latency.
+
+    The loop gates on os.stat() and only opens the file when its signature
+    changes: holding a read handle open every few milliseconds on Windows can make
+    the game's own write/delete fail with a sharing violation.
+
+    Returns elapsed milliseconds, or None on timeout / unreadable path.
+    """
+    if not filepath:
+        return None
+
+    start = time.perf_counter()
+    deadline = start + (timeout_ms / 1000.0)
+    last_sig: Optional[Tuple[int, int]] = None
+
+    while time.perf_counter() < deadline:
+        try:
+            st = os.stat(filepath)
+        except FileNotFoundError:
+            return (time.perf_counter() - start) * 1000.0
+        except OSError:
+            time.sleep(poll_ms / 1000.0)
+            continue
+
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig != last_sig:
+            last_sig = sig
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    if json.load(f).get("execute") is False:
+                        return (time.perf_counter() - start) * 1000.0
+            except FileNotFoundError:
+                return (time.perf_counter() - start) * 1000.0
+            except Exception:
+                pass
+
+        time.sleep(poll_ms / 1000.0)
+
+    return None
+
+
+class MarketFileWatcher:
+    """
+    Change-driven reader for mods/export/market.json.
+
+    The game rewrites this file about once per second. The upstream loop polled
+    every 120 ms and re-parsed it each time, so ~7 of every 8 iterations did full
+    JSON parsing, feature extraction and inference on data that had not changed.
+    poll() exposes the file signature so the caller can do that work only when a
+    new frame actually exists.
+    """
+
+    def __init__(self, game_dir: Optional[str] = None):
+        self.game_dir = game_dir
+        self._raw: Optional[bytes] = None
+        self.last_change_at: float = 0.0
+        self.polls: int = 0
+        self.frames: int = 0
+
+    def poll(self, force: bool = False) -> Tuple[bool, Optional[Dict[str, Any]], Optional[float]]:
+        """
+        Returns (changed, snapshot, age_ms).
+
+        changed    True only when a new market frame was published.
+        snapshot   Normalised snapshot, or None when unchanged/unavailable.
+        age_ms     Age of the export file in milliseconds (staleness detection).
+
+        Change detection compares the file bytes rather than relying on the
+        timestamp: Windows can hand back an identical st_mtime_ns for two writes
+        that land close together, which would silently skip a frame. Reading the
+        34 KB export costs tens of microseconds; parsing it costs ~1 ms, so the
+        expensive half is still skipped for all but the first frame.
+        """
+        self.polls += 1
+        paths = get_game_paths(self.game_dir)
+        mfile = paths.get("market") or ""
+        if not mfile:
+            return False, None, None
+        try:
+            st = os.stat(mfile)
+            with open(mfile, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False, None, None
+
+        age_ms = (time.time() - st.st_mtime) * 1000.0
+        if not force and raw == self._raw:
+            return False, None, age_ms
+
+        try:
+            data = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            return False, None, age_ms
+
+        snap = normalise_market_data(data)
+        if snap is None:
+            return False, None, age_ms
+
+        self._raw = raw
+        self.last_change_at = time.time()
+        self.frames += 1
+        return True, snap, age_ms
+
+    def is_stale(self, age_ms: Optional[float]) -> bool:
+        """True when the export file has not advanced for longer than the limit."""
+        if age_ms is None:
+            return True
+        return age_ms > SNAPSHOT_STALE_S * 1000.0
 
 
 def read_in_game_settings(game_dir: Optional[str] = None) -> Dict[str, Any]:

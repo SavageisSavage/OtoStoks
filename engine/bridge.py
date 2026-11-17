@@ -7,17 +7,36 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional, Tuple
 
-from core.config import get_base_dir, check_game_process
+from core.config import (
+    get_base_dir,
+    check_game_process,
+    COMMAND_CONFIRM_TIMEOUT_MS,
+    HTTP_BRIDGE_BACKOFF_S,
+    HTTP_BRIDGE_FAILS_BEFORE_BACKOFF,
+    SNAPSHOT_STALE_S,
+)
 from core.game_mod import (
     find_game_dir,
     get_game_paths,
     ensure_native_mod_support,
     read_native_market_file,
-    dispatch_native_order
+    dispatch_native_order,
+    wait_command_consumed,
+    MarketFileWatcher,
 )
 
 # Active bridge transport mode: 'http', 'native_mod', or None
 CURRENT_TRANSPORT = "http"
+
+# The HTTP bridge only exists when the BepInEx DLL is loaded into the game. Probing
+# a closed port on every loop iteration costs a connection attempt, and if the port
+# is filtered rather than refused it costs the full timeout. Back off instead.
+_http_fails: int = 0
+_http_backoff_until: float = 0.0
+
+# Shared change-driven reader for the native export file.
+FILE_WATCHER = MarketFileWatcher()
+
 
 
 def run_auto_installer() -> Tuple[bool, str]:
@@ -99,15 +118,26 @@ def run_auto_installer() -> Tuple[bool, str]:
 
 def fetch_snapshot_http(host: str = "127.0.0.1", port: int = 8765, timeout: float = 0.8) -> Optional[Dict[str, Any]]:
     """Fetches full market and portfolio snapshot from in-game HTTP server."""
+    global _http_fails, _http_backoff_until
+
+    if time.time() < _http_backoff_until:
+        return None
+
     try:
         req = urllib.request.Request(f"http://{host}:{port}/snapshot")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode('utf-8'))
             if data and data.get("marketReady", False):
                 data["source"] = "http_bridge"
+                _http_fails = 0
+                _http_backoff_until = 0.0
                 return data
     except Exception:
         pass
+
+    _http_fails += 1
+    if _http_fails >= HTTP_BRIDGE_FAILS_BEFORE_BACKOFF:
+        _http_backoff_until = time.time() + HTTP_BRIDGE_BACKOFF_S
     return None
 
 
@@ -133,12 +163,41 @@ def fetch_snapshot(host: str = "127.0.0.1", port: int = 8765) -> Optional[Dict[s
     return None
 
 
+def fetch_snapshot_change() -> Tuple[bool, Optional[Dict[str, Any]], Optional[float]]:
+    """
+    Change-driven variant of fetch_snapshot() for the main loop.
+
+    Returns (changed, snapshot, age_ms). On the native transport `changed` is False
+    whenever the game has not rewritten market.json, which lets the loop skip
+    parsing, feature extraction and inference for a frame it already processed.
+    The HTTP bridge exposes no file signature, so when it is live every call is
+    treated as a new frame.
+    """
+    global CURRENT_TRANSPORT
+
+    snap = fetch_snapshot_http(timeout=0.6)
+    if snap and snap.get("marketReady", False):
+        CURRENT_TRANSPORT = "http"
+        return True, snap, 0.0
+
+    changed, native_snap, age_ms = FILE_WATCHER.poll()
+    if changed and native_snap:
+        CURRENT_TRANSPORT = "native_mod"
+        return True, native_snap, age_ms
+
+    return False, None, age_ms
+
+
 def reconcile_order_status(ticker: str, action: str) -> Optional[Dict[str, Any]]:
     """
     Checks snapshot after a timed-out dispatch to verify if the trade was already filled in-game,
     preventing duplicate execution on retry.
     """
-    snap = fetch_snapshot()
+    return _reconcile_from_snapshot(fetch_snapshot(), ticker, action)
+
+
+def _reconcile_from_snapshot(snap: Optional[Dict[str, Any]], ticker: str, action: str) -> Optional[Dict[str, Any]]:
+    """Position check against an already-parsed snapshot (no extra fetch)."""
     if not snap or "stocks" not in snap:
         return None
 
@@ -201,7 +260,7 @@ def dispatch_order_http(order_payload: Dict[str, Any], host: str = "127.0.0.1", 
                 reconciled = reconcile_order_status(ticker, action)
                 if reconciled:
                     return reconciled
-                time.sleep(0.15)
+                time.sleep(0.02)
                 continue
             return None
     return None
@@ -224,20 +283,47 @@ def dispatch_order(order_payload: Dict[str, Any], host: str = "127.0.0.1", port:
             return res
 
     # Native Mod Command dispatch fallback
-    ok, msg = dispatch_native_order(ticker, action, amount, is_max=is_max)
-    if ok:
-        # Give the game tick loop a moment and reconcile
-        time.sleep(0.12)
-        reconciled = reconcile_order_status(ticker, action)
-        if reconciled:
-            return reconciled
+    t_dispatch = time.perf_counter()
+    ok, msg, cmd_path = dispatch_native_order(ticker, action, amount, is_max=is_max)
+    if not ok:
+        return {"success": False, "message": msg}
+
+    # Wait for the game to actually pick the command up rather than sleeping a
+    # fixed 120 ms and hoping. This is the real order-pickup latency.
+    pickup_ms = wait_command_consumed(cmd_path)
+    if pickup_ms is None:
         return {
-            "success": True,
-            "message": msg,
-            "filledPrice": 0.0,
-            "shares": 0
+            "success": False,
+            "message": f"{msg} (game did not consume the command within {COMMAND_CONFIRM_TIMEOUT_MS} ms)",
         }
-    return {"success": False, "message": msg}
+
+    # The resulting position only becomes visible in a later export frame. Use a
+    # private watcher so this does not steal frames from the main loop.
+    deadline = time.perf_counter() + 0.35
+    confirm_watcher = MarketFileWatcher()
+    reconciled = None
+    while time.perf_counter() < deadline:
+        changed, snap, _ = confirm_watcher.poll()
+        if changed and snap:
+            reconciled = _reconcile_from_snapshot(snap, ticker, action)
+            if reconciled:
+                break
+        time.sleep(0.01)
+
+    dispatch_ms = (time.perf_counter() - t_dispatch) * 1000.0
+    if reconciled:
+        reconciled["pickupMs"] = round(pickup_ms, 3)
+        reconciled["dispatchMs"] = round(dispatch_ms, 3)
+        return reconciled
+
+    return {
+        "success": True,
+        "message": msg,
+        "filledPrice": 0.0,
+        "shares": 0,
+        "pickupMs": round(pickup_ms, 3),
+        "dispatchMs": round(dispatch_ms, 3),
+    }
 
 
 def check_bridge_health(host: str = "127.0.0.1", port: int = 8765) -> bool:

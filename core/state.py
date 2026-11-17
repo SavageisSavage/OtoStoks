@@ -39,6 +39,7 @@ class AppState:
         self.server_tick: int = 0
         self.last_update_time: float = 0.0
         self.inf_latency_ms: float = 0.0
+        self.pipeline_metrics: Dict[str, Any] = {}
 
         # Capital & Portfolio Risk State
         self.reserved_cash: float = 0.0
@@ -286,6 +287,7 @@ class AppState:
                 "game_pid": self.game_pid,
                 "server_tick": self.server_tick,
                 "inf_latency_ms": round(self.inf_latency_ms, 3),
+                "pipeline": self.pipeline_metrics,
                 "auto_time_remaining": self.auto_time_remaining_str,
                 "player": self.player,
                 "stocks": stock_list,
