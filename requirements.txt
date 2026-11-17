@@ -1,9 +1,20 @@
+# Runtime dependencies.
+#
+# websockets is NOT optional: uvicorn refuses WebSocket upgrades without it or
+# wsproto, which silently breaks the live dashboard (the bot keeps trading, so
+# the failure is easy to miss). It is a uvicorn transport dependency, not a
+# duplicate of anything FastAPI provides.
+#
+# pandas was listed upstream but is imported nowhere, so it is no longer required.
+#
+# lightgbm / onnxmltools / skl2onnx are runtime, not build-time: they power the
+# in-app auto-retrain pipeline. Without them the app still trades, but retraining
+# is disabled (HAS_TRAIN_LIBS is False).
 fastapi>=0.110.0
 uvicorn>=0.28.0
 websockets>=12.0
 pydantic>=2.6.0
 numpy>=1.26.0
-pandas>=2.2.0
 onnxruntime>=1.17.0
 lightgbm>=4.3.0
 onnxmltools>=1.12.0
@@ -11,4 +22,3 @@ skl2onnx>=1.16.0
 protobuf>=5.26.0
 proto-plus>=1.23.0
 pywebview>=5.0.0
-pyinstaller>=6.5.0

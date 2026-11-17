@@ -16,11 +16,13 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={localappdata}\Programs\OtoStoksBot
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
-OutputDir=C:\Users\HP\Downloads
+; Paths are resolved relative to this script so the build works from any checkout.
+; Upstream pointed every Source: line at C:\Users\HP\.gemini\antigravity\scratch\...
+OutputDir=dist
 OutputBaseFilename=OtoStoksBot-Setup
-SetupIconFile=C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\icon.ico
-WizardSmallImageFile=C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\assets\wizard_small.bmp
-WizardImageFile=C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\assets\wizard_large.bmp
+SetupIconFile=icon.ico
+WizardSmallImageFile=assets\wizard_small.bmp
+WizardImageFile=assets\wizard_large.bmp
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -34,13 +36,13 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 
 [Files]
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\dist\OtoStoksBot-WINDOWS.exe"; DestDir: "{app}"; DestName: "OtoStoksBot.exe"; Flags: ignoreversion
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\icon.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\icon.png"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\OtoStoksBridge.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\ScreenStocksLocalBridge.dll"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\model.onnx"; DestDir: "{app}"; Flags: ignoreversion
-Source: "C:\Users\HP\.gemini\antigravity\scratch\OtoStoksBot\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\OtoStoksBot-WINDOWS.exe"; DestDir: "{app}"; DestName: "OtoStoksBot.exe"; Flags: ignoreversion
+Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "icon.png"; DestDir: "{app}"; Flags: ignoreversion
+; One bridge assembly is enough; upstream shipped two byte-identical copies.
+Source: "OtoStoksBridge.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "model.onnx"; DestDir: "{app}"; Flags: ignoreversion
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\icon.ico"

@@ -87,3 +87,89 @@ OtoStoksBot Pro v4.0 is a high-frequency, multi-regime autonomous algorithmic tr
 - Windows 10/11 (64-bit), macOS 12+ (Apple Silicon or Intel), or modern Linux distribution (Ubuntu 20.04+, Debian 11+, Arch, Fedora).
 - Python 3.10+ (if running directly from source code).
 - Screen Stocks (Steam App ID: 4356780).
+
+---
+
+## Fork notes (this repository)
+
+This is a working fork of upstream `SavageisSavage/OtoStoks`. See `UPSTREAM.md` for
+where the source came from and why the `v5` tag archive on GitHub cannot be used.
+
+### What changed: decision latency
+
+The game republishes `mods/export/market.json` roughly once per second (median
+1002 ms, p95 1058 ms over a 900-sample window). Upstream polled that file every
+120 ms and re-parsed it unconditionally, so most iterations did full work on
+unchanged data. Measured on a real install:
+
+| Stage | Upstream | This fork |
+|---|---|---|
+| `tasklist` process check | 158 ms **on the event loop**, every 2 s | 45 ms, in a worker thread, skipped while the feed is live |
+| Reaction to a new frame | 0-120 ms (avg 60) | ~0-10 ms |
+| Unchanged-frame work | read + parse, 0.26 ms | one byte compare, 0.08 ms |
+| ONNX evaluation | 17 calls per frame | 1 batched call (3.0x faster) |
+| Order dispatch | blind `sleep(0.12)` + re-read | pickup confirmation via `stat` |
+| HTTP bridge probe | every iteration | only when the file feed is quiet |
+
+End-to-end on a live install (game running, native transport, 119 frames):
+
+| Stage | p50 | p95 | max |
+|---|---|---|---|
+| `snapshot_wait` | 0.30 ms | 0.36 ms | 8.1 ms |
+| `features` | 1.87 ms | 2.77 ms | 2.8 ms |
+| `inference` | 0.11 ms | 0.13 ms | 0.25 ms |
+| `decision` | 0.14 ms | 0.16 ms | 0.23 ms |
+| `cycle` | 3.64 ms | 10.76 ms | 11.2 ms |
+
+The game publishes once per second, so the full pipeline is ~0.4% of the budget
+between frames. Three separate stalls had to be removed to get there: the
+blocking `tasklist` call, an HTTP probe that cost 600 ms whenever it fired, and a
+stale-feed check that misread the game's own file write as a dead connection.
+
+Pipeline timings are recorded per stage and published on the dashboard header
+(`state.pipeline_metrics`): `snapshot_wait`, `features`, `inference`, `decision`,
+`dispatch`, `cycle`. The header shows the median cycle; hover it for the per-stage
+breakdown.
+
+### Running from source
+
+Requires **Python 3.12**; the pinned ONNX/LightGBM wheels are not published for
+3.13+ yet.
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Windows;  source .venv/bin/activate elsewhere
+pip install -r requirements.txt
+python main.py
+```
+
+`requirements-dev.txt` adds the packaging tools (`pyinstaller`). The installer
+script is `setup_script.iss` (Inno Setup) and now uses paths relative to the
+checkout.
+
+### Tests and measurement
+
+```bash
+python -m unittest discover -s tests -v      # 31 tests, stdlib only, no game needed
+python tools/bench_feed.py --seconds 10      # feed path against the live export
+python tools/verify_env.py                   # deps, ONNX model, inference benchmark
+```
+
+The test suite builds a synthetic game directory, so it exercises the mod file
+protocol (`mods/export/market.json`, `mods/commands/<TICKER>/*.json`) without
+Screen Stocks running.
+
+### Known caveats
+
+- `websockets` is a required runtime dependency, not a leftover. Without it
+  uvicorn refuses WebSocket upgrades and the dashboard never updates while the
+  bot keeps trading, so the failure is silent unless you check the browser
+  console.
+- The bridge DLL (`OtoStoksBridge.dll`) is a prebuilt BepInEx/Harmony assembly
+  with no source in any release. Rebuilding it is a separate C# project.
+- Upstream has no `LICENSE`, so all rights are reserved by default. Keep this
+  fork private unless the author grants a license.
+- `mods/commands/<TICKER>/*.json` is polled with `os.stat` gating: holding a read
+  handle on those files every few milliseconds can make the game's own
+  write/delete fail on Windows.
+

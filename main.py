@@ -5,7 +5,6 @@ Main application entry point.
 import os
 import sys
 import time
-import socket
 import urllib.request
 import threading
 import webbrowser
@@ -86,7 +85,7 @@ def main():
 
     if HAS_WEBVIEW:
         try:
-            window = webview.create_window(
+            webview.create_window(
                 title="OtoStoksBot Pro",
                 url=server_url,
                 width=1420,
